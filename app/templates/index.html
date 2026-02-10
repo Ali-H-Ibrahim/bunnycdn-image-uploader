@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Processor</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="container">
+
+    <!-- Header -->
+    <header>
+        <h1>Image Processor</h1>
+        <p class="subtitle">Download product images and upload them to your CDN</p>
+    </header>
+
+    <main>
+
+        <!-- ─── Upload Section ─────────────────────────── -->
+        <section id="uploadSection" class="card">
+            <h2>New Job</h2>
+            <form id="uploadForm">
+
+                <!-- File -->
+                <div class="form-group">
+                    <label for="file">JSON File</label>
+                    <div class="file-upload" id="fileUpload">
+                        <input type="file" id="file" name="file" accept=".json" required>
+                        <div class="file-upload-label">
+                            <span class="icon">&#128193;</span>
+                            <span id="fileName">Choose a JSON file or drag it here</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- File Stats (shown after upload) -->
+                <details id="fileStats" class="file-stats hidden">
+                    <summary class="file-stats-toggle">
+                        File Statistics
+                        <span class="file-stats-brief" id="fstatBrief"></span>
+                    </summary>
+                    <div class="file-stats-body">
+                        <div class="file-stats-numbers">
+                            <div class="file-stat">
+                                <span class="file-stat-value" id="fstatProducts">0</span>
+                                <span class="file-stat-label">Products</span>
+                            </div>
+                            <div class="file-stat">
+                                <span class="file-stat-value" id="fstatImages">0</span>
+                                <span class="file-stat-label">Images</span>
+                            </div>
+                            <div class="file-stat">
+                                <span class="file-stat-value" id="fstatBrands">0</span>
+                                <span class="file-stat-label">Brands</span>
+                            </div>
+                        </div>
+                        <div id="brandChartWrap" class="brand-chart-wrap hidden">
+                            <h3>Brand Distribution</h3>
+                            <div class="brand-chart-row">
+                                <canvas id="brandChart" width="180" height="180"></canvas>
+                                <div id="brandLegend" class="brand-legend"></div>
+                            </div>
+                        </div>
+                    </div>
+                </details>
+
+                <!-- Image Fields (auto-detected) -->
+                <div class="form-group">
+                    <label>Image Fields</label>
+                    <div id="fieldsContainer" class="fields-container">
+                        <p class="fields-placeholder" id="fieldsPlaceholder">
+                            Upload a JSON file to auto-detect image fields
+                        </p>
+                    </div>
+                    <!-- Manual fallback -->
+                    <div id="manualEntry" class="hidden">
+                        <textarea id="manualPaths" rows="2"
+                                  placeholder="Custom path, e.g. media.images[]"></textarea>
+                    </div>
+                    <a href="#" id="toggleManual" class="toggle-link hidden">+ Add custom path</a>
+                </div>
+
+                <!-- Advanced Settings -->
+                <details class="advanced">
+                    <summary>Advanced Settings</summary>
+                    <div class="settings-grid">
+
+                        <div class="form-group">
+                            <label for="products_key">Products Key</label>
+                            <input type="text" id="products_key" name="products_key"
+                                   placeholder="auto-detect">
+                            <small class="help">Leave empty if JSON is an array</small>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="product_id_key">Product ID Key</label>
+                            <input type="text" id="product_id_key" name="product_id_key"
+                                   placeholder="auto-detect">
+                            <small class="help">Field used as folder name on CDN</small>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="upload_path_prefix">Upload Path Prefix</label>
+                            <input type="text" id="upload_path_prefix"
+                                   name="upload_path_prefix" value="test">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="proxy_mode">Proxy Mode</label>
+                            <select id="proxy_mode" name="proxy_mode">
+                                <option value="fallback" selected>
+                                    Fallback (direct first, then proxy)
+                                </option>
+                                <option value="off">Off</option>
+                                <option value="always">Always use proxy</option>
+                                <option value="allowlist">Allowlist domains only</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="proxy_domains">Proxy Domains</label>
+                            <input type="text" id="proxy_domains" name="proxy_domains"
+                                   placeholder="amazon.com, walmart.com">
+                            <small class="help">Comma-separated (for allowlist mode)</small>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="referer">Referer Header</label>
+                            <input type="text" id="referer" name="referer"
+                                   placeholder="auto (same domain)">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="concurrency">Concurrency</label>
+                            <input type="number" id="concurrency" name="concurrency"
+                                   value="20" min="1" max="50">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="chunk_size">Chunk Size</label>
+                            <input type="number" id="chunk_size" name="chunk_size"
+                                   value="1000" min="100" max="5000">
+                        </div>
+                    </div>
+                </details>
+
+                <button type="submit" class="btn-primary" id="submitBtn">
+                    Start Processing
+                </button>
+            </form>
+        </section>
+
+        <!-- ─── Progress Section ───────────────────────── -->
+        <section id="progressSection" class="card hidden">
+            <h2>Processing</h2>
+            <div class="progress-info">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill"></div>
+                </div>
+                <div class="progress-text" id="progressText">Starting...</div>
+            </div>
+            <div class="stats-grid">
+                <div class="stat">
+                    <span class="stat-value" id="statProducts">0 / 0</span>
+                    <span class="stat-label">Products</span>
+                </div>
+                <div class="stat stat-success">
+                    <span class="stat-value" id="statSucceeded">0</span>
+                    <span class="stat-label">Succeeded</span>
+                </div>
+                <div class="stat stat-danger">
+                    <span class="stat-value" id="statFailed">0</span>
+                    <span class="stat-label">Failed</span>
+                </div>
+                <div class="stat stat-warning">
+                    <span class="stat-value" id="statSkipped">0</span>
+                    <span class="stat-label">Skipped</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- ─── Results Section ────────────────────────── -->
+        <section id="resultsSection" class="card hidden">
+            <h2 id="resultsTitle">Complete!</h2>
+            <p id="resultsSummary"></p>
+            <div class="results-actions">
+                <a id="downloadResult" class="btn-primary" download>
+                    Download Result JSON
+                </a>
+                <a id="downloadErrors" class="btn-secondary" download>
+                    Download Error Report
+                </a>
+            </div>
+            <button class="btn-outline" onclick="resetForm()">
+                Process Another File
+            </button>
+        </section>
+
+    </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
