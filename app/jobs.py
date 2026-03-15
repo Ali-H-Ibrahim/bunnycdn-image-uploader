@@ -72,6 +72,10 @@ class JobManager:
         if job_id in self._jobs:
             self._jobs[job_id].failed_images += 1
 
+    def decrement_failed(self, job_id: str):
+        if job_id in self._jobs:
+            self._jobs[job_id].failed_images = max(0, self._jobs[job_id].failed_images - 1)
+
     def increment_skipped(self, job_id: str):
         if job_id in self._jobs:
             self._jobs[job_id].skipped_images += 1

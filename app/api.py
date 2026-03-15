@@ -16,7 +16,7 @@ from app.models import JobConfig, ProxyMode
 from app.pipeline import process_job
 
 router = APIRouter()
-templates = Jinja2Templates(directory=os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates"))
+templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
 
 
 # ── Web UI ───────────────────────────────────────────────
@@ -42,6 +42,8 @@ async def create_job(
     referer: str = Form(""),
     concurrency: int = Form(20),
     chunk_size: int = Form(1000),
+    failed_retry_rounds: int = Form(2),
+    enable_failed_retry_pass: bool = Form(True),
 ):
     # Parse multi-line or comma-separated image paths
     paths = [p.strip() for p in image_paths.replace(",", "\n").split("\n") if p.strip()]
@@ -60,6 +62,8 @@ async def create_job(
         referer=referer,
         concurrency=min(concurrency, 50),
         chunk_size=min(chunk_size, 5000),
+        failed_retry_rounds=max(0, min(failed_retry_rounds, 10)),
+        enable_failed_retry_pass=enable_failed_retry_pass,
     )
 
     # Create job & save uploaded file
@@ -99,3 +103,43 @@ async def download_errors(job_id: str):
     if not os.path.exists(path):
         raise HTTPException(404, "Error report not ready yet")
     return FileResponse(path, filename=f"errors_{job_id}.json", media_type="application/json")
+
+
+@router.post("/v1/jobs/{job_id}/retry-from-errors")
+async def retry_from_errors(job_id: str):
+    """Create a new job that retries all failed images from an existing job."""
+    from app.pipeline import process_job_retry_from_errors
+
+    source_job_dir = job_manager.get_job_dir(job_id)
+    
+    if not os.path.exists(os.path.join(source_job_dir, "errors.json")):
+        raise HTTPException(404, "errors.json not found for this job")
+    if not os.path.exists(os.path.join(source_job_dir, "input.json")):
+        raise HTTPException(404, "input.json not found for this job")
+    
+    try:
+        config = job_manager.get_config(job_id)
+    except FileNotFoundError:
+        raise HTTPException(404, "Job config not found")
+
+    new_job_id = job_manager.create_job(config)
+    new_job_dir = job_manager.get_job_dir(new_job_id)
+
+    import shutil
+    shutil.copy(
+        os.path.join(source_job_dir, "input.json"),
+        os.path.join(new_job_dir, "input.json")
+    )
+    shutil.copy(
+        os.path.join(source_job_dir, "errors.json"),
+        os.path.join(new_job_dir, "source_errors.json")
+    )
+
+    asyncio.create_task(process_job_retry_from_errors(new_job_id))
+
+    return {
+        "job_id": new_job_id,
+        "status": "queued",
+        "source_job_id": job_id,
+        "message": "Retry job created - will process failed images only"
+    }

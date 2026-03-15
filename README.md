@@ -2,6 +2,10 @@
 
 This is a simple FastAPI project for processing image links and uploading files to BunnyCDN storage.
 
+**New:** Automatic retry for failed images is available (configurable in Advanced Settings: retry rounds and enable/disable). Failed images are retried before final output; you can also retry later via the API using the errors report.
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/15C4bjc1eL1jucErS9dzt05RnJdawRMsA?usp=sharing)
+
 ## Requirements
 
 - Python 3.10+ (recommended)

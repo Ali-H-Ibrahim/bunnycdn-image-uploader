@@ -104,6 +104,227 @@ def save_output(filepath: str, input_data: InputData):
 # ── Main Entry Point ────────────────────────────────────
 
 
+async def process_job_retry_from_errors(job_id: str):
+    """Retry failed images from a previous job's errors.json."""
+    try:
+        config = job_manager.get_config(job_id)
+        job_dir = job_manager.get_job_dir(job_id)
+        input_path = os.path.join(job_dir, "input.json")
+        source_errors_path = os.path.join(job_dir, "source_errors.json")
+
+        job_manager.update_status(job_id, JobStatus.PROCESSING)
+
+        input_data = await asyncio.to_thread(load_input, input_path, config.products_key)
+        products = input_data.products
+
+        with open(source_errors_path, "r", encoding="utf-8") as f:
+            source_errors = json.load(f)
+
+        retriable_errors = [
+            err for err in source_errors
+            if err.get("error_type") not in ("invalid_source", "not_found")
+            and err.get("status") != "not_found"
+        ]
+
+        job_manager.set_totals(job_id, len(products), len(retriable_errors))
+        logger.info("Job %s: Retry from errors - %d images", job_id, len(retriable_errors))
+
+        downloader = ImageDownloader(
+            proxy_url=settings.proxy_url,
+            proxy_mode=config.proxy_mode.value,
+            proxy_domains=config.proxy_domains,
+            referer=config.referer,
+            timeout=settings.download_timeout,
+            max_retries=settings.max_retries,
+        )
+        uploader = BunnyUploader(
+            storage_zone=settings.bunny_storage_zone,
+            access_key=settings.bunny_access_key,
+            cdn_base_url=settings.bunny_cdn_base_url,
+        )
+
+        new_errors: list[dict] = []
+        semaphore = asyncio.Semaphore(config.concurrency)
+        retry_tasks = []
+
+        for err in retriable_errors:
+            product_idx = err.get("product_index")
+            if product_idx is None or product_idx >= len(products):
+                continue
+
+            product = products[product_idx]
+            keys = err.get("keys")
+            if not keys:
+                continue
+
+            source_url = err.get("source_url")
+            product_id = err.get("product_id", f"product_{product_idx}")
+
+            retry_tasks.append(
+                asyncio.create_task(
+                    _process_image_for_retry(
+                        sem=semaphore,
+                        product=product,
+                        keys=keys,
+                        source_url=source_url,
+                        product_id=product_id,
+                        product_index=product_idx,
+                        upload_prefix=config.upload_path_prefix,
+                        downloader=downloader,
+                        uploader=uploader,
+                        job_id=job_id,
+                        errors=new_errors,
+                    )
+                )
+            )
+
+        await asyncio.gather(*retry_tasks)
+
+        for product in products:
+            cleanup_removed_images(product, config.image_paths)
+
+        await downloader.close()
+        await uploader.close()
+
+        await asyncio.to_thread(
+            save_output, os.path.join(job_dir, "result.json"), input_data
+        )
+        await asyncio.to_thread(
+            _save_errors, os.path.join(job_dir, "errors.json"), new_errors
+        )
+
+        job_manager.complete_job(job_id)
+        logger.info("Job %s: Retry from errors completed", job_id)
+
+    except Exception as exc:
+        logger.exception("Job %s retry failed: %s", job_id, exc)
+        job_manager.complete_job(job_id, error_message=str(exc))
+
+
+async def _process_image_for_retry(
+    sem: asyncio.Semaphore,
+    product: dict,
+    keys: list,
+    source_url: str,
+    product_id: str,
+    product_index: int,
+    upload_prefix: str,
+    downloader: ImageDownloader,
+    uploader: BunnyUploader,
+    job_id: str,
+    errors: list[dict],
+):
+    """Process a single image from retry errors list."""
+    async with sem:
+        source_type = SOURCE_URL
+        if not source_url.startswith(("http://", "https://")):
+            if source_url.startswith("/") or source_url.startswith(("./", "../")) or \
+               (len(source_url) > 1 and source_url[1] == ":"):
+                source_type = SOURCE_FILE
+            else:
+                source_type = SOURCE_INVALID
+
+        if source_type == SOURCE_INVALID:
+            job_manager.increment_failed(job_id)
+            errors.append({
+                "product_index": product_index,
+                "product_id": product_id,
+                "image_path": _format_keys(keys),
+                "keys": keys,
+                "source_url": source_url,
+                "status": "failed",
+                "error_type": "invalid_source",
+                "http_status": None,
+                "error_message": f"Not a valid URL or file path: {source_url!r}",
+                "stage": "validation",
+                "attempts": 0,
+                "used_proxy": False,
+            })
+            update_image_url(product, keys, REMOVE_MARKER)
+            return
+
+        if source_type == SOURCE_FILE:
+            read_result = await asyncio.to_thread(_read_local_file, source_url)
+        else:
+            read_result = await downloader.download(source_url)
+
+        if read_result.status == "not_found":
+            job_manager.increment_skipped(job_id)
+            errors.append({
+                "product_index": product_index,
+                "product_id": product_id,
+                "image_path": _format_keys(keys),
+                "keys": keys,
+                "source_url": source_url,
+                "status": "not_found",
+                "error_type": "not_found",
+                "http_status": 404 if source_type == SOURCE_URL else None,
+                "error_message": "Image not found" if source_type == SOURCE_URL
+                    else f"File not found: {source_url}",
+                "stage": "download" if source_type == SOURCE_URL else "read_file",
+                "attempts": read_result.attempts,
+                "used_proxy": read_result.used_proxy,
+            })
+            update_image_url(product, keys, REMOVE_MARKER)
+            return
+
+        if read_result.status != "ok":
+            job_manager.increment_failed(job_id)
+            errors.append({
+                "product_index": product_index,
+                "product_id": product_id,
+                "image_path": _format_keys(keys),
+                "keys": keys,
+                "source_url": source_url,
+                "status": "failed",
+                "error_type": read_result.error_type,
+                "http_status": read_result.http_status,
+                "error_message": read_result.error_message,
+                "stage": "download" if source_type == SOURCE_URL else "read_file",
+                "attempts": read_result.attempts,
+                "used_proxy": read_result.used_proxy,
+            })
+            update_image_url(product, keys, REMOVE_MARKER)
+            return
+
+        filename = generate_filename(read_result.data, read_result.content_type)
+        upload_path = f"{upload_prefix}/{product_id}"
+        upload_result = await uploader.upload(read_result.data, upload_path, filename)
+
+        if upload_result["status"] != "ok":
+            job_manager.increment_failed(job_id)
+            errors.append({
+                "product_index": product_index,
+                "product_id": product_id,
+                "image_path": _format_keys(keys),
+                "keys": keys,
+                "source_url": source_url,
+                "status": "failed",
+                "error_type": "upload_error",
+                "http_status": None,
+                "error_message": upload_result.get("error", "Upload failed"),
+                "stage": "upload",
+                "attempts": read_result.attempts,
+                "used_proxy": read_result.used_proxy,
+            })
+            update_image_url(product, keys, REMOVE_MARKER)
+            return
+
+        update_image_url(product, keys, upload_result["url"])
+        job_manager.increment_succeeded(job_id)
+
+
+def _format_keys(keys) -> str:
+    """['variants', 0, 'Image'] → 'variants[0].Image'"""
+    parts: list[str] = []
+    for k in keys:
+        if isinstance(k, int):
+            parts[-1] = f"{parts[-1]}[{k}]"
+        else:
+            parts.append(k)
+    return ".".join(parts)
+
+
 async def process_job(job_id: str):
     """Background task that processes an entire job."""
     try:
@@ -178,13 +399,25 @@ async def process_job(job_id: str):
             # Wait for all images in the chunk
             await asyncio.gather(*tasks)
 
-            # Cleanup: remove failed/invalid entries from products
-            for product in chunk:
-                cleanup_removed_images(product, config.image_paths)
-
             # Mark products as processed
             for _ in chunk:
                 job_manager.increment_processed(job_id)
+
+        # ── Retry failed images (if enabled) ─────────────
+        if config.enable_failed_retry_pass and config.failed_retry_rounds > 0:
+            all_errors = await _retry_failed_images(
+                all_errors=all_errors,
+                products=products,
+                config=config,
+                downloader=downloader,
+                uploader=uploader,
+                job_id=job_id,
+                retry_rounds=config.failed_retry_rounds,
+            )
+
+        # ── Final cleanup: remove failed entries ─────────
+        for product in products:
+            cleanup_removed_images(product, config.image_paths)
 
         # ── Cleanup & save ───────────────────────────────
         await downloader.close()
@@ -232,6 +465,129 @@ def _save_errors(filepath: str, errors: list[dict]):
         json.dump(errors, f, ensure_ascii=False, indent=2)
 
 
+async def _retry_failed_images(
+    all_errors: list[dict],
+    products: list[dict],
+    config,
+    downloader: ImageDownloader,
+    uploader: BunnyUploader,
+    job_id: str,
+    retry_rounds: int,
+):
+    """
+    Retry failed images for N rounds, removing successful ones from errors.
+    Returns the final error list after all retries.
+    """
+    if retry_rounds <= 0 or not all_errors:
+        return all_errors
+
+    logger.info("Job %s: Starting %d retry round(s) for %d failed images", 
+                job_id, retry_rounds, len(all_errors))
+
+    for round_num in range(1, retry_rounds + 1):
+        retriable_errors = [
+            err for err in all_errors
+            if err["error_type"] not in ("invalid_source", "not_found")
+            and err["status"] != "not_found"
+        ]
+
+        if not retriable_errors:
+            logger.info("Job %s: No retriable errors remaining", job_id)
+            break
+
+        logger.info("Job %s: Retry round %d/%d - attempting %d images",
+                    job_id, round_num, retry_rounds, len(retriable_errors))
+
+        semaphore = asyncio.Semaphore(config.concurrency)
+        retry_tasks = []
+        success_indices = []
+
+        for err_idx, err in enumerate(retriable_errors):
+            product_idx = err["product_index"]
+            if product_idx >= len(products):
+                continue
+
+            product = products[product_idx]
+            keys = err["keys"]
+            source_url = err["source_url"]
+
+            retry_tasks.append(
+                asyncio.create_task(
+                    _retry_single_image(
+                        sem=semaphore,
+                        product=product,
+                        keys=keys,
+                        source_url=source_url,
+                        product_id=err["product_id"],
+                        upload_prefix=config.upload_path_prefix,
+                        downloader=downloader,
+                        uploader=uploader,
+                        job_id=job_id,
+                        success_indices=success_indices,
+                        err_idx=err_idx,
+                    )
+                )
+            )
+
+        await asyncio.gather(*retry_tasks)
+
+        if success_indices:
+            logger.info("Job %s: Round %d succeeded on %d images",
+                        job_id, round_num, len(success_indices))
+
+            for idx in sorted(success_indices, reverse=True):
+                original_err = retriable_errors[idx]
+                all_errors.remove(original_err)
+        else:
+            logger.info("Job %s: Round %d - no new successes", job_id, round_num)
+
+    logger.info("Job %s: Retry complete - %d errors remain", job_id, len(all_errors))
+    return all_errors
+
+
+async def _retry_single_image(
+    sem: asyncio.Semaphore,
+    product: dict,
+    keys: list,
+    source_url: str,
+    product_id: str,
+    upload_prefix: str,
+    downloader: ImageDownloader,
+    uploader: BunnyUploader,
+    job_id: str,
+    success_indices: list,
+    err_idx: int,
+):
+    """Retry a single failed image and update on success."""
+    async with sem:
+        source_type = SOURCE_URL
+        if not source_url.startswith(("http://", "https://")):
+            if source_url.startswith("/") or source_url.startswith(("./", "../", "C:", "D:")):
+                source_type = SOURCE_FILE
+            else:
+                return
+
+        if source_type == SOURCE_FILE:
+            read_result = await asyncio.to_thread(_read_local_file, source_url)
+        else:
+            read_result = await downloader.download(source_url)
+
+        if read_result.status != "ok":
+            return
+
+        filename = generate_filename(read_result.data, read_result.content_type)
+        upload_path = f"{upload_prefix}/{product_id}"
+        upload_result = await uploader.upload(read_result.data, upload_path, filename)
+
+        if upload_result["status"] != "ok":
+            return
+
+        update_image_url(product, keys, upload_result["url"])
+        job_manager.increment_succeeded(job_id)
+        job_manager.decrement_failed(job_id)
+        success_indices.append(err_idx)
+
+
 # ── Single Image Processing ─────────────────────────────
 
 
@@ -255,6 +611,7 @@ async def _process_image(
                 "product_index": product_index,
                 "product_id": product_id,
                 "image_path": loc.path_display,
+                "keys": loc.keys,
                 "source_url": loc.original_url,
                 "status": "failed",
                 "error_type": "invalid_source",
@@ -328,6 +685,7 @@ def _error_dict(
         "product_index": product_index,
         "product_id": product_id,
         "image_path": loc.path_display,
+        "keys": loc.keys,
         "source_url": loc.original_url,
         "status": status,
         "error_type": error_type,

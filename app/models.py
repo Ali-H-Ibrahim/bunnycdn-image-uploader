@@ -34,6 +34,8 @@ class JobConfig(BaseModel):
     referer: str = ""
     concurrency: int = 20
     chunk_size: int = 1000
+    failed_retry_rounds: int = 2      # number of retry passes for failed images
+    enable_failed_retry_pass: bool = True  # enable automatic retry for failed images
 
 
 # ── Job Progress (tracked in memory) ────────────────────
